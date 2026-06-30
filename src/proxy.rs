@@ -2,18 +2,29 @@ use std::fmt::{self, Write as _};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 use url::Url;
 
 use crate::http::{header_end, MAX_HTTP_HEADER};
 use crate::target::{format_target, Target};
+
+#[cfg(not(test))]
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const PROXY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const PROXY_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug)]
 enum ProxyKind {
@@ -82,36 +93,64 @@ impl ProxyConfig {
     pub(crate) async fn connect(&self, target: &Target) -> Result<ProxyStream> {
         match self.kind {
             ProxyKind::Http => {
-                let mut stream = TcpStream::connect((self.host.as_str(), self.port))
-                    .await
-                    .with_context(|| format!("connect HTTP proxy {}:{}", self.host, self.port))?;
-                let prefix = self.http_connect(&mut stream, target).await?;
+                let mut stream = timeout(
+                    UPSTREAM_CONNECT_TIMEOUT,
+                    TcpStream::connect((self.host.as_str(), self.port)),
+                )
+                .await
+                .context("timed out connecting to HTTP proxy")?
+                .with_context(|| format!("connect HTTP proxy {}:{}", self.host, self.port))?;
+                let prefix = timeout(
+                    PROXY_HANDSHAKE_TIMEOUT,
+                    self.http_connect(&mut stream, target),
+                )
+                .await
+                .context("timed out during HTTP proxy CONNECT")??;
                 Ok(ProxyStream::Plain(PrefixedStream::new(stream, prefix)))
             }
             ProxyKind::Https => {
-                let stream = TcpStream::connect((self.host.as_str(), self.port))
-                    .await
-                    .with_context(|| format!("connect HTTPS proxy {}:{}", self.host, self.port))?;
+                let stream = timeout(
+                    UPSTREAM_CONNECT_TIMEOUT,
+                    TcpStream::connect((self.host.as_str(), self.port)),
+                )
+                .await
+                .context("timed out connecting to HTTPS proxy")?
+                .with_context(|| format!("connect HTTPS proxy {}:{}", self.host, self.port))?;
                 let connector = self
                     .tls_connector
                     .clone()
                     .ok_or_else(|| anyhow!("HTTPS proxy connector missing"))?;
                 let dns_name = ServerName::try_from(self.host.clone())
                     .context("HTTPS proxy host is not a valid TLS server name")?;
-                let mut stream = connector
-                    .connect(dns_name, stream)
-                    .await
-                    .context("TLS handshake with HTTPS proxy")?;
-                let prefix = self.http_connect(&mut stream, target).await?;
+                let mut stream =
+                    timeout(PROXY_HANDSHAKE_TIMEOUT, connector.connect(dns_name, stream))
+                        .await
+                        .context("timed out during HTTPS proxy TLS handshake")?
+                        .context("TLS handshake with HTTPS proxy")?;
+                let prefix = timeout(
+                    PROXY_HANDSHAKE_TIMEOUT,
+                    self.http_connect(&mut stream, target),
+                )
+                .await
+                .context("timed out during HTTPS proxy CONNECT")??;
                 Ok(ProxyStream::Tls(Box::new(PrefixedStream::new(
                     stream, prefix,
                 ))))
             }
             ProxyKind::Socks5 => {
-                let mut stream = TcpStream::connect((self.host.as_str(), self.port))
-                    .await
-                    .with_context(|| format!("connect SOCKS5 proxy {}:{}", self.host, self.port))?;
-                self.socks5_connect(&mut stream, target).await?;
+                let mut stream = timeout(
+                    UPSTREAM_CONNECT_TIMEOUT,
+                    TcpStream::connect((self.host.as_str(), self.port)),
+                )
+                .await
+                .context("timed out connecting to SOCKS5 proxy")?
+                .with_context(|| format!("connect SOCKS5 proxy {}:{}", self.host, self.port))?;
+                timeout(
+                    PROXY_HANDSHAKE_TIMEOUT,
+                    self.socks5_connect(&mut stream, target),
+                )
+                .await
+                .context("timed out during SOCKS5 handshake")??;
                 Ok(ProxyStream::Plain(PrefixedStream::new(stream, Vec::new())))
             }
         }
@@ -470,6 +509,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_connect_times_out_waiting_for_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 256];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                request.extend_from_slice(&buf[..n]);
+                if header_end(&request).is_some() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let proxy = ProxyConfig::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+        let target = Target {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+        let err = match proxy.connect(&target).await {
+            Ok(_) => panic!("HTTP CONNECT unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("timed out during HTTP proxy CONNECT"));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn socks5_connect_uses_domain_name_and_auth() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -517,5 +590,30 @@ mod tests {
         let mut tunnel = proxy.connect(&target).await.unwrap();
         tunnel.shutdown().await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_connect_times_out_during_handshake() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let proxy = ProxyConfig::parse(&format!("socks5://127.0.0.1:{port}")).unwrap();
+        let target = Target {
+            host: "example.com".to_string(),
+            port: 443,
+        };
+        let err = match proxy.connect(&target).await {
+            Ok(_) => panic!("SOCKS5 connect unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert!(err
+            .to_string()
+            .contains("timed out during SOCKS5 handshake"));
+        server.abort();
     }
 }
