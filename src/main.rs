@@ -44,6 +44,9 @@ struct Cli {
 
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    #[arg(long, help = "Disable the HTTP listener on port 80")]
+    no_http: bool,
 }
 
 #[tokio::main]
@@ -57,29 +60,40 @@ async fn main() -> Result<()> {
 
     let proxy = Arc::new(ProxyConfig::parse(&cli.proxy)?);
     let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    let http_listener = TcpListener::bind((cli.listen, 80))
-        .await
-        .with_context(|| format!("bind {}:80", cli.listen))?;
     let https_listener = TcpListener::bind((cli.listen, 443))
         .await
         .with_context(|| format!("bind {}:443", cli.listen))?;
 
-    info!(listen = %cli.listen, proxy = ?proxy, "nyasniproxy started");
+    info!(listen = %cli.listen, proxy = ?proxy, http = !cli.no_http, "nyasniproxy started");
 
-    tokio::try_join!(
-        accept_loop(
-            http_listener,
-            InboundProtocol::Http,
-            Arc::clone(&proxy),
-            Arc::clone(&connection_limit),
-        ),
+    if cli.no_http {
         accept_loop(
             https_listener,
             InboundProtocol::Https,
             proxy,
-            connection_limit
-        ),
-    )?;
+            connection_limit,
+        )
+        .await?;
+    } else {
+        let http_listener = TcpListener::bind((cli.listen, 80))
+            .await
+            .with_context(|| format!("bind {}:80", cli.listen))?;
+
+        tokio::try_join!(
+            accept_loop(
+                http_listener,
+                InboundProtocol::Http,
+                Arc::clone(&proxy),
+                Arc::clone(&connection_limit),
+            ),
+            accept_loop(
+                https_listener,
+                InboundProtocol::Https,
+                proxy,
+                connection_limit
+            ),
+        )?;
+    }
 
     Ok(())
 }

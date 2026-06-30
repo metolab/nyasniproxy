@@ -24,6 +24,12 @@ The program binds `127.0.0.2:80` and `127.0.0.2:443` by default. Binding low por
 sudo setcap cap_net_bind_service=+ep ./target/release/nyasniproxy
 ```
 
+To proxy only HTTPS traffic, disable the HTTP listener:
+
+```sh
+sudo ./target/release/nyasniproxy --listen 127.0.0.2 --proxy socks5://user:pass@127.0.0.1:1080 --no-http
+```
+
 ## Proxy URLs
 
 Supported upstream proxy schemes:
