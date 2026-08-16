@@ -4,31 +4,79 @@
 It extracts the real destination from HTTP `Host` or TLS SNI, then opens a tunnel through an upstream HTTP,
 HTTPS, or SOCKS5 proxy.
 
+Configuration is a YAML file (local path or HTTP(S) URL) with multiple proxies, per-host routing, fallback,
+and a default route. The program can keep a managed block in the hosts file in sync and reload routing when
+the config file changes or a remote URL is refreshed.
+
 ## Usage
 
 ```sh
 cargo build --release
-sudo ./target/release/nyasniproxy --listen 127.0.0.2 --proxy socks5://user:pass@127.0.0.1:1080
+sudo ./target/release/nyasniproxy --config ./config.yaml
+sudo ./target/release/nyasniproxy --config https://example.com/sni.yaml --listen 127.0.0.2 --refresh 30
+sudo ./target/release/nyasniproxy --config ./config.yaml --no-http --hosts /etc/hosts
 ```
 
-Example `/etc/hosts` entry:
+CLI flags override YAML. Precedence is **CLI > YAML > built-in defaults**.
 
-```text
-127.0.0.2 example.com www.example.com
-```
+- `--config`: local YAML path or HTTP(S) URL (required)
+- `--listen`: loopback listen address (default `127.0.0.2`)
+- `--hosts`: hosts file path (Unix default `/etc/hosts`, Windows system hosts)
+- `--no-hosts`: disable hosts file sync
+- `--no-http`: disable the HTTP listener on port 80
+- `--refresh`: remote config poll interval in seconds (default `30`)
+- `--log-level`: log filter (default `info`)
 
-The program binds `127.0.0.2:80` and `127.0.0.2:443` by default. Binding low ports usually requires
-`sudo`. On Linux you can alternatively grant the binary the bind capability:
+The program binds `LISTEN:80` and `LISTEN:443` by default. Binding low ports usually requires `sudo`.
+On Linux you can alternatively grant the binary the bind capability:
 
 ```sh
 sudo setcap cap_net_bind_service=+ep ./target/release/nyasniproxy
 ```
 
-To proxy only HTTPS traffic, disable the HTTP listener:
+Writing `/etc/hosts` also needs permission to that file.
 
-```sh
-sudo ./target/release/nyasniproxy --listen 127.0.0.2 --proxy socks5://user:pass@127.0.0.1:1080 --no-http
+## Config
+
+```yaml
+proxies:
+  jp: http://user:pass@1.2.3.4:8080
+  us: http://user:pass@5.6.7.8:8080
+  backup: http://127.0.0.1:8081
+
+rules:
+  netflix.com: us
+  www.netflix.com: [us, jp]
+  default: [jp, backup]
 ```
+
+Optional YAML fields (overridden by CLI when set):
+
+```yaml
+listen: 127.0.0.2
+hosts: /etc/hosts    # or false to disable sync
+refresh: 30
+http: true
+```
+
+`rules` values are a proxy name or a fallback list tried in order. Matching is exact and case-insensitive.
+Hostnames must be valid DNS names (no wildcards or whitespace). `default` is required and is used for unknown Host/SNI values.
+
+Local files are watched and reloaded on change. HTTP(S) URLs are polled every `--refresh` seconds (default 30).
+Invalid reloads keep the last good routing table. `listen`, HTTP enablement, hosts path, and refresh are applied
+at startup; later YAML changes to those fields are ignored until restart.
+
+## Hosts sync
+
+The program maintains a managed block and leaves the rest of the file unchanged:
+
+```text
+# BEGIN nyasniproxy
+127.0.0.2 netflix.com www.netflix.com
+# END nyasniproxy
+```
+
+Hostnames come from `rules` except `default`. The address is the listen IP. Disable with `--no-hosts` or `hosts: false`.
 
 ## Proxy URLs
 

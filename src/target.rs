@@ -51,6 +51,26 @@ pub(crate) fn format_target(target: &Target) -> String {
     }
 }
 
+pub(crate) fn is_valid_hostname(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 || host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
+    host.split('.').all(is_valid_dns_label)
+}
+
+fn is_valid_dns_label(label: &str) -> bool {
+    let len = label.len();
+    if len == 0 || len > 63 {
+        return false;
+    }
+    let bytes = label.as_bytes();
+    bytes[0].is_ascii_alphanumeric()
+        && bytes[len - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +100,26 @@ mod tests {
     #[test]
     fn rejects_empty_host() {
         assert!(parse_host_port("", 80).is_err());
+    }
+
+    #[test]
+    fn hostname_validation_accepts_dns_names() {
+        assert!(is_valid_hostname("localhost"));
+        assert!(is_valid_hostname("example.com"));
+        assert!(is_valid_hostname("www.example.com"));
+        assert!(is_valid_hostname("xn--fsq.com"));
+        assert!(is_valid_hostname("a-b.example"));
+    }
+
+    #[test]
+    fn hostname_validation_rejects_injection_and_wildcards() {
+        assert!(!is_valid_hostname(""));
+        assert!(!is_valid_hostname("example.com."));
+        assert!(!is_valid_hostname("*.example.com"));
+        assert!(!is_valid_hostname("foo.com\n1.2.3.4 google.com"));
+        assert!(!is_valid_hostname("foo.com google.com"));
+        assert!(!is_valid_hostname("foo.com#comment"));
+        assert!(!is_valid_hostname("-bad.com"));
+        assert!(!is_valid_hostname("bad-.com"));
     }
 }

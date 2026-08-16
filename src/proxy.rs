@@ -57,7 +57,7 @@ impl fmt::Debug for ProxyConfig {
 
 impl ProxyConfig {
     pub(crate) fn parse(raw: &str) -> Result<Self> {
-        let url = Url::parse(raw).context("parse --proxy URL")?;
+        let url = Url::parse(raw).context("parse proxy URL")?;
         let kind = match url.scheme() {
             "http" => ProxyKind::Http,
             "https" => ProxyKind::Https,
@@ -297,10 +297,18 @@ where
 }
 
 fn tls_client_config() -> ClientConfig {
+    ensure_crypto_provider();
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth()
+}
+
+pub(crate) fn ensure_crypto_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
 }
 
 pub(crate) struct PrefixedStream<S> {

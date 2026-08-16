@@ -8,7 +8,11 @@ license = "MIT"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+notify = "8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rustls-pki-types = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 tracing = "0.1"

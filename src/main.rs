@@ -1,9 +1,14 @@
+mod config;
+mod hosts;
 mod http;
 mod proxy;
+mod reload;
+mod router;
 mod target;
 mod tls;
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,11 +16,15 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use tokio::time::{sleep, timeout, Instant};
 use tracing::{debug, info};
 
-use crate::proxy::ProxyConfig;
+use crate::config::{
+    fetch_config, http_client, merge_settings, parse_yaml, CliOverrides, ConfigSource,
+};
+use crate::reload::{apply_hosts, prepare_source, run_reload_loop};
+use crate::router::{connect_with_fallback, Runtime};
 use crate::target::format_target;
 
 const MAX_CONNECTIONS: usize = 1024;
@@ -36,17 +45,29 @@ const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
     about = "SNI/Host transparent loopback proxy to HTTP(S)/SOCKS5 upstreams"
 )]
 struct Cli {
-    #[arg(long, default_value = "127.0.0.2")]
-    listen: IpAddr,
+    #[arg(long, help = "YAML config file path or HTTP(S) URL")]
+    config: String,
 
-    #[arg(long)]
-    proxy: String,
+    #[arg(long, help = "Loopback listen address")]
+    listen: Option<IpAddr>,
 
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    #[arg(long, conflicts_with = "no_hosts", help = "Hosts file to keep in sync")]
+    hosts: Option<PathBuf>,
+
+    #[arg(long, conflicts_with = "hosts", help = "Disable hosts file sync")]
+    no_hosts: bool,
 
     #[arg(long, help = "Disable the HTTP listener on port 80")]
     no_http: bool,
+
+    #[arg(
+        long,
+        help = "Seconds between remote config refreshes (default 30, overrides YAML)"
+    )]
+    refresh: Option<u64>,
+
+    #[arg(long, default_value = "info")]
+    log_level: String,
 }
 
 #[tokio::main]
@@ -54,45 +75,78 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log_level)?;
 
-    if !cli.listen.is_loopback() {
-        bail!("--listen must be a loopback address, got {}", cli.listen);
-    }
+    let overrides = CliOverrides {
+        listen: cli.listen,
+        hosts: cli.hosts.clone(),
+        no_hosts: cli.no_hosts,
+        no_http: cli.no_http,
+        refresh: cli.refresh,
+    };
+    let source = ConfigSource::parse(&cli.config)?;
+    let client = http_client()?;
+    let text = fetch_config(&source, &client).await?;
+    let yaml = parse_yaml(&text)?;
+    let settings = merge_settings(&yaml, &overrides)?;
+    let runtime = Runtime::from_yaml(&yaml)?;
+    let source = prepare_source(source).await;
 
-    let proxy = Arc::new(ProxyConfig::parse(&cli.proxy)?);
     let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    let https_listener = TcpListener::bind((cli.listen, 443))
+    let https_listener = TcpListener::bind((settings.listen, 443))
         .await
-        .with_context(|| format!("bind {}:443", cli.listen))?;
-
-    info!(listen = %cli.listen, proxy = ?proxy, http = !cli.no_http, "nyasniproxy started");
-
-    if cli.no_http {
-        accept_loop(
-            https_listener,
-            InboundProtocol::Https,
-            proxy,
-            connection_limit,
+        .with_context(|| format!("bind {}:443", settings.listen))?;
+    let http_listener = if settings.http {
+        Some(
+            TcpListener::bind((settings.listen, 80))
+                .await
+                .with_context(|| format!("bind {}:80", settings.listen))?,
         )
-        .await?;
     } else {
-        let http_listener = TcpListener::bind((cli.listen, 80))
-            .await
-            .with_context(|| format!("bind {}:80", cli.listen))?;
+        None
+    };
 
+    apply_hosts(&settings, &runtime);
+
+    info!(
+        listen = %settings.listen,
+        http = settings.http,
+        hosts = ?settings.hosts_path,
+        refresh_secs = settings.refresh.as_secs(),
+        config = %source,
+        "nyasniproxy started"
+    );
+
+    let (runtime_tx, runtime_rx) = watch::channel(Arc::new(runtime));
+    tokio::spawn(run_reload_loop(
+        source,
+        client,
+        settings.clone(),
+        runtime_tx,
+        yaml,
+    ));
+
+    if let Some(http_listener) = http_listener {
         tokio::try_join!(
             accept_loop(
                 http_listener,
                 InboundProtocol::Http,
-                Arc::clone(&proxy),
+                runtime_rx.clone(),
                 Arc::clone(&connection_limit),
             ),
             accept_loop(
                 https_listener,
                 InboundProtocol::Https,
-                proxy,
+                runtime_rx,
                 connection_limit
             ),
         )?;
+    } else {
+        accept_loop(
+            https_listener,
+            InboundProtocol::Https,
+            runtime_rx,
+            connection_limit,
+        )
+        .await?;
     }
 
     Ok(())
@@ -114,7 +168,7 @@ enum InboundProtocol {
 async fn accept_loop(
     listener: TcpListener,
     protocol: InboundProtocol,
-    proxy: Arc<ProxyConfig>,
+    runtime: watch::Receiver<Arc<Runtime>>,
     connection_limit: Arc<Semaphore>,
 ) -> Result<()> {
     loop {
@@ -123,10 +177,10 @@ async fn accept_loop(
             debug!(%peer, ?protocol, max_connections = MAX_CONNECTIONS, "connection limit reached");
             continue;
         };
-        let proxy = Arc::clone(&proxy);
+        let runtime = runtime.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(err) = handle_connection(stream, protocol, proxy).await {
+            if let Err(err) = handle_connection(stream, protocol, runtime).await {
                 debug!(%peer, ?protocol, error = %err, "connection closed");
             }
         });
@@ -139,6 +193,12 @@ mod tests {
 
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
+    fn test_runtime(proxy_url: &str) -> watch::Receiver<Arc<Runtime>> {
+        let runtime = Arc::new(Runtime::single_proxy(proxy_url).unwrap());
+        let (_tx, rx) = watch::channel(runtime);
+        rx
+    }
+
     #[tokio::test]
     async fn handle_connection_times_out_reading_initial_http_header() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -146,9 +206,9 @@ mod tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
         let _client = client;
-        let proxy = Arc::new(ProxyConfig::parse("http://127.0.0.1:9").unwrap());
+        let runtime = test_runtime("http://127.0.0.1:9");
 
-        let err = handle_connection(server, InboundProtocol::Http, proxy)
+        let err = handle_connection(server, InboundProtocol::Http, runtime)
             .await
             .unwrap_err();
 
@@ -214,7 +274,7 @@ mod tests {
 async fn handle_connection(
     mut inbound: TcpStream,
     protocol: InboundProtocol,
-    proxy: Arc<ProxyConfig>,
+    runtime: watch::Receiver<Arc<Runtime>>,
 ) -> Result<()> {
     let (target, initial) = match protocol {
         InboundProtocol::Http => {
@@ -229,8 +289,14 @@ async fn handle_connection(
         }
     };
 
-    info!(?protocol, target = %format_target(&target), "opening upstream tunnel");
-    let mut upstream = proxy.connect(&target).await?;
+    let hops = runtime.borrow().router.lookup(&target.host).to_vec();
+    info!(
+        ?protocol,
+        target = %format_target(&target),
+        via = ?hops.iter().map(|hop| hop.name.as_str()).collect::<Vec<_>>(),
+        "opening upstream tunnel"
+    );
+    let mut upstream = connect_with_fallback(&hops, &target).await?;
     timeout(INITIAL_UPSTREAM_WRITE_TIMEOUT, upstream.write_all(&initial))
         .await
         .context("timed out writing initial traffic upstream")??;
