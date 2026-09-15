@@ -6,6 +6,7 @@ mod reload;
 mod router;
 mod target;
 mod tls;
+mod watchdog;
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -20,10 +21,11 @@ use tokio::sync::{watch, Semaphore};
 use tokio::time::{sleep, timeout, Instant};
 use tracing::{debug, info};
 
-use crate::config::{
-    fetch_config, http_client, merge_settings, parse_yaml, CliOverrides, ConfigSource,
+use crate::config::{merge_settings, parse_yaml, CliOverrides, ConfigSource};
+use crate::reload::{
+    apply_hosts, fetch_with_hard_timeout, prepare_source, run_reload_loop, DefaultFetcher,
+    InFlightFetches, CONFIG_FETCH_HARD_TIMEOUT,
 };
-use crate::reload::{apply_hosts, prepare_source, run_reload_loop};
 use crate::router::{connect_with_fallback, Runtime};
 use crate::target::format_target;
 
@@ -82,13 +84,31 @@ async fn main() -> Result<()> {
         no_http: cli.no_http,
         refresh: cli.refresh,
     };
+    let heartbeat = watchdog::Heartbeat::new();
+    let _watchdog = watchdog::spawn_watchdog(
+        Arc::clone(&heartbeat),
+        watchdog::WATCHDOG_STALL_TIMEOUT,
+        watchdog::WATCHDOG_POLL_INTERVAL,
+        || watchdog::watchdog_suicide(),
+    );
+
     let source = ConfigSource::parse(&cli.config)?;
-    let client = http_client()?;
-    let text = fetch_config(&source, &client).await?;
+    let fetcher = Arc::new(DefaultFetcher);
+    let in_flight = InFlightFetches::new(crate::reload::MAX_IN_FLIGHT_FETCHES);
+    let text = fetch_with_hard_timeout(
+        Arc::clone(&fetcher),
+        source.clone(),
+        Arc::clone(&in_flight),
+        CONFIG_FETCH_HARD_TIMEOUT,
+    )
+    .await
+    .map_err(|err| anyhow!("{err}"))?;
+    heartbeat.beat();
     let yaml = parse_yaml(&text)?;
     let settings = merge_settings(&yaml, &overrides)?;
     let runtime = Runtime::from_yaml(&yaml)?;
     let source = prepare_source(source).await;
+    heartbeat.beat();
 
     let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let https_listener = TcpListener::bind((settings.listen, 443))
@@ -103,8 +123,10 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    heartbeat.beat();
 
-    apply_hosts(&settings, &runtime);
+    apply_hosts(&settings, &runtime).await;
+    heartbeat.beat();
 
     info!(
         listen = %settings.listen,
@@ -112,18 +134,21 @@ async fn main() -> Result<()> {
         hosts = ?settings.hosts_path,
         refresh_secs = settings.refresh.as_secs(),
         config = %source,
+        worker_threads = std::thread::available_parallelism().ok().map(|n| n.get()),
         "nyasniproxy started"
     );
 
     let (runtime_tx, runtime_rx) = watch::channel(Arc::new(runtime));
     tokio::spawn(run_reload_loop(
         source,
-        client,
+        fetcher,
         settings.clone(),
         runtime_tx,
         yaml,
+        in_flight,
     ));
 
+    heartbeat.beat();
     if let Some(http_listener) = http_listener {
         tokio::try_join!(
             accept_loop(
@@ -131,12 +156,18 @@ async fn main() -> Result<()> {
                 InboundProtocol::Http,
                 runtime_rx.clone(),
                 Arc::clone(&connection_limit),
+                Arc::clone(&heartbeat),
+                #[cfg(test)]
+                None,
             ),
             accept_loop(
                 https_listener,
                 InboundProtocol::Https,
                 runtime_rx,
-                connection_limit
+                connection_limit,
+                heartbeat,
+                #[cfg(test)]
+                None,
             ),
         )?;
     } else {
@@ -145,6 +176,9 @@ async fn main() -> Result<()> {
             InboundProtocol::Https,
             runtime_rx,
             connection_limit,
+            heartbeat,
+            #[cfg(test)]
+            None,
         )
         .await?;
     }
@@ -170,20 +204,37 @@ async fn accept_loop(
     protocol: InboundProtocol,
     runtime: watch::Receiver<Arc<Runtime>>,
     connection_limit: Arc<Semaphore>,
+    heartbeat: Arc<watchdog::Heartbeat>,
+    #[cfg(test)] accepted: Option<tokio::sync::mpsc::Sender<(TcpStream, std::net::SocketAddr)>>,
 ) -> Result<()> {
+    let mut beat = tokio::time::interval(watchdog::ACCEPT_HEARTBEAT_INTERVAL);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let Ok(permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
-            debug!(%peer, ?protocol, max_connections = MAX_CONNECTIONS, "connection limit reached");
-            continue;
-        };
-        let runtime = runtime.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(err) = handle_connection(stream, protocol, runtime).await {
-                debug!(%peer, ?protocol, error = %err, "connection closed");
+        tokio::select! {
+            result = listener.accept() => {
+                heartbeat.beat();
+                let (stream, peer) = result?;
+                #[cfg(test)]
+                if let Some(tx) = &accepted {
+                    let _ = tx.try_send((stream, peer));
+                    continue;
+                }
+                let Ok(permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
+                    debug!(%peer, ?protocol, max_connections = MAX_CONNECTIONS, "connection limit reached");
+                    continue;
+                };
+                let runtime = runtime.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(err) = handle_connection(stream, protocol, runtime).await {
+                        debug!(%peer, ?protocol, error = %err, "connection closed");
+                    }
+                });
             }
-        });
+            _ = beat.tick() => {
+                heartbeat.beat();
+            }
+        }
     }
 }
 
@@ -191,7 +242,9 @@ async fn accept_loop(
 mod tests {
     use super::*;
 
+    use crate::reload::{reload_once, BlockingFetch, MAX_IN_FLIGHT_FETCHES};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::mpsc;
 
     fn test_runtime(proxy_url: &str) -> watch::Receiver<Arc<Runtime>> {
         let runtime = Arc::new(Runtime::single_proxy(proxy_url).unwrap());
@@ -268,6 +321,138 @@ mod tests {
         drop(upstream_server);
         let result = relay.await.unwrap().unwrap();
         assert_eq!(result.0, 3);
+    }
+
+    struct FailFetcher;
+
+    impl BlockingFetch for FailFetcher {
+        fn fetch(&self, _source: &crate::config::ConfigSource) -> anyhow::Result<String> {
+            anyhow::bail!("synthetic fetch failure");
+        }
+    }
+
+    struct SlowFetcher;
+
+    impl BlockingFetch for SlowFetcher {
+        fn fetch(&self, _source: &crate::config::ConfigSource) -> anyhow::Result<String> {
+            std::thread::sleep(CONFIG_FETCH_HARD_TIMEOUT + Duration::from_millis(50));
+            anyhow::bail!("slow fetch")
+        }
+    }
+
+    fn dummy_runtime() -> (watch::Sender<Arc<Runtime>>, watch::Receiver<Arc<Runtime>>) {
+        let runtime = Arc::new(Runtime::single_proxy("http://127.0.0.1:9").unwrap());
+        watch::channel(runtime)
+    }
+
+    #[tokio::test]
+    async fn fetch_failure_does_not_stop_userspace_accept() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let heartbeat = watchdog::Heartbeat::new();
+        let (runtime_tx, runtime_rx) = dummy_runtime();
+        let before = runtime_tx.borrow().fingerprint();
+        let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let (tx, mut rx) = mpsc::channel(4);
+        let loop_handle = tokio::spawn(accept_loop(
+            listener,
+            InboundProtocol::Http,
+            runtime_rx,
+            limit,
+            Arc::clone(&heartbeat),
+            Some(tx),
+        ));
+
+        let source = ConfigSource::parse("https://example.com/sni.yaml").unwrap();
+        let settings = crate::config::StaticSettings {
+            listen: "127.0.0.1".parse().unwrap(),
+            http: true,
+            hosts_path: None,
+            refresh: Duration::from_secs(30),
+        };
+        let yaml = crate::config::parse_yaml(
+            r#"
+proxies:
+  jp: http://127.0.0.1:8080
+rules:
+  default: jp
+"#,
+        )
+        .unwrap();
+        let mut last_yaml = yaml;
+        let in_flight = InFlightFetches::new(MAX_IN_FLIGHT_FETCHES);
+
+        reload_once(
+            &source,
+            &Arc::new(FailFetcher),
+            &settings,
+            &runtime_tx,
+            &mut last_yaml,
+            &in_flight,
+        )
+        .await;
+        assert_eq!(runtime_tx.borrow().fingerprint(), before);
+
+        reload_once(
+            &source,
+            &Arc::new(SlowFetcher),
+            &settings,
+            &runtime_tx,
+            &mut last_yaml,
+            &in_flight,
+        )
+        .await;
+        assert_eq!(runtime_tx.borrow().fingerprint(), before);
+
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let accepted = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("accept_loop must poll listener.accept()")
+            .expect("accepted stream");
+        drop(accepted);
+        loop_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn idle_accept_loop_beats_without_clients() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let heartbeat = watchdog::Heartbeat::new();
+        let before = heartbeat.last_ms();
+
+        let (_runtime_tx, runtime_rx) = dummy_runtime();
+        let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let (stall_tx, mut stall_rx) = tokio::sync::oneshot::channel();
+        let _wd = watchdog::spawn_watchdog(
+            Arc::clone(&heartbeat),
+            watchdog::WATCHDOG_STALL_TIMEOUT,
+            watchdog::WATCHDOG_POLL_INTERVAL,
+            move || {
+                let _ = stall_tx.send(());
+            },
+        );
+
+        let loop_handle = tokio::spawn(accept_loop(
+            listener,
+            InboundProtocol::Http,
+            runtime_rx,
+            limit,
+            Arc::clone(&heartbeat),
+            None,
+        ));
+
+        tokio::time::sleep(watchdog::ACCEPT_HEARTBEAT_INTERVAL * 3).await;
+        assert!(
+            heartbeat.last_ms() > before,
+            "idle accept tick must call beat() without clients"
+        );
+
+        tokio::time::sleep(watchdog::WATCHDOG_STALL_TIMEOUT * 3).await;
+        assert!(
+            stall_rx.try_recv().is_err(),
+            "watchdog must not fire while idle accept_loop is being polled"
+        );
+
+        loop_handle.abort();
     }
 }
 

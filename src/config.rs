@@ -213,7 +213,11 @@ async fn read_file_limited(path: &Path, max_bytes: usize) -> Result<String> {
     String::from_utf8(buf).context("config is not valid UTF-8")
 }
 
-async fn fetch_url_limited(client: &reqwest::Client, url: &Url, max_bytes: usize) -> Result<String> {
+async fn fetch_url_limited(
+    client: &reqwest::Client,
+    url: &Url,
+    max_bytes: usize,
+) -> Result<String> {
     let response = client
         .get(url.clone())
         .send()
@@ -312,6 +316,7 @@ pub(crate) fn http_client() -> Result<reqwest::Client> {
     crate::proxy::ensure_crypto_provider();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
         .build()
         .map_err(|err| anyhow!("build HTTP client: {err}"))
 }
@@ -577,7 +582,9 @@ rules:
             .build()
             .unwrap();
         let source = ConfigSource::parse(&format!("http://127.0.0.1:{port}/sni.yaml")).unwrap();
-        let err = fetch_config_limited(&source, &client, 64).await.unwrap_err();
+        let err = fetch_config_limited(&source, &client, 64)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("larger than 64 bytes"));
     }
 
@@ -594,7 +601,9 @@ rules:
         std::fs::write(&path, vec![b'a'; 128]).unwrap();
         let client = reqwest::Client::new();
         let source = ConfigSource::File(path.clone());
-        let err = fetch_config_limited(&source, &client, 64).await.unwrap_err();
+        let err = fetch_config_limited(&source, &client, 64)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("exceeds 64 bytes"));
         let _ = std::fs::remove_file(&path);
     }

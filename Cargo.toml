@@ -1,11 +1,12 @@
 [package]
 name = "nyasniproxy"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 
 [dependencies]
 anyhow = "1"
+libc = "0.2"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 notify = "8"

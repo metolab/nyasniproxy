@@ -66,6 +66,17 @@ Local files are watched and reloaded on change. HTTP(S) URLs are polled every `-
 Invalid reloads keep the last good routing table. `listen`, HTTP enablement, hosts path, and refresh are applied
 at startup; later YAML changes to those fields are ignored until restart.
 
+Remote fetches (including DNS) run on a dedicated thread with a **15s hard timeout** so a hung
+`getaddrinfo` cannot stall accept. Each poll logs one of `config poll completed`, `config poll failed`,
+or `config poll skipped` at info/warn/error (visible at the default `--log-level info`).
+`--refresh` should be ≥ 15s; shorter values are allowed but will skip while a previous fetch is still
+in flight.
+
+If the accept loop stops being polled for **30s**, the process `_exit(1)`s so a supervisor such as
+launchd KeepAlive can restart it. KeepAlive must treat a non-zero exit as a restart
+(boolean `KeepAlive` or `KeepAlive.SuccessfulExit = false`). Do not put the config URL hostname in
+the managed hosts block, or config fetches will hairpin through the proxy.
+
 ## Hosts sync
 
 The program maintains a managed block and leaves the rest of the file unchanged:
