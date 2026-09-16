@@ -68,9 +68,24 @@ pub(crate) fn spawn_watchdog(
 pub(crate) fn watchdog_suicide() -> ! {
     const MSG: &[u8] =
         b"nyasniproxy watchdog: accept loop stalled; exiting so launchd KeepAlive can restart\n";
+    // libc::write / _exit avoid tracing locks and stdio flush. STDERR_FILENO is
+    // Unix-only; Windows CRT still uses fd 2 and takes count as c_uint.
     unsafe {
-        libc::write(libc::STDERR_FILENO, MSG.as_ptr().cast(), MSG.len());
-        libc::_exit(1);
+        #[cfg(unix)]
+        {
+            libc::write(libc::STDERR_FILENO, MSG.as_ptr().cast(), MSG.len());
+            libc::_exit(1);
+        }
+        #[cfg(windows)]
+        {
+            libc::write(2, MSG.as_ptr().cast(), MSG.len() as u32);
+            libc::_exit(1);
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = MSG;
+            std::process::abort();
+        }
     }
 }
 
